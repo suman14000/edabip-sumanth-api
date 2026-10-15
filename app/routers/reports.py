@@ -1,10 +1,21 @@
-from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import or_
+from datetime import datetime
+from typing import Literal
+
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
+from app.core.dependencies import get_current_user, require_admin
 from app.database import get_db
 from app.models.report import Report
 from app.models.report_template import ReportTemplate
+from app.models.user import User
+from app.repositories.report_repository import (
+    create_report,
+    delete_report,
+    get_report,
+    list_reports,
+    update_report,
+)
 from app.schemas.report import (
     DistributionItem,
     ReportCreate,
@@ -18,258 +29,163 @@ from app.services.report_service import (
     get_report_type_distribution,
 )
 
-
 router = APIRouter(
     prefix="/api/reports",
-    tags=["Reports"]
+    tags=["Reports"],
+    dependencies=[Depends(get_current_user)],
 )
 
 
-@router.get(
-    "/summary",
-    response_model=ReportSummary
-)
-def report_summary(
-    db: Session = Depends(get_db)
-):
+@router.get("/summary", response_model=ReportSummary)
+def summary(db: Session = Depends(get_db)):
     return get_report_summary(db)
 
 
-@router.get(
-    "/type-distribution",
-    response_model=list[DistributionItem]
-)
-def report_type_distribution(
-    db: Session = Depends(get_db)
-):
+@router.get("/type-distribution", response_model=list[DistributionItem])
+def type_distribution(db: Session = Depends(get_db)):
     return get_report_type_distribution(db)
 
 
-@router.get(
-    "/status-distribution",
-    response_model=list[DistributionItem]
-)
-def report_status_distribution(
-    db: Session = Depends(get_db)
-):
+@router.get("/status-distribution", response_model=list[DistributionItem])
+def status_distribution(db: Session = Depends(get_db)):
     return get_report_status_distribution(db)
+
+
+@router.get("", response_model=list[ReportResponse])
+def read_reports(
+    search: str | None = None,
+    module: str | None = None,
+    report_type: Literal["Scheduled", "On Demand"] | None = None,
+    report_status: Literal["Completed", "Failed", "Scheduled"] | None = Query(
+        default=None, alias="status"
+    ),
+    owner: str | None = None,
+    date_from: datetime | None = None,
+    date_to: datetime | None = None,
+    sort_by: Literal[
+        "id", "report_name", "module", "report_type",
+        "status", "owner", "created_at", "last_run"
+    ] = "created_at",
+    order: Literal["asc", "desc"] = "desc",
+    page: int = Query(default=1, ge=1),
+    limit: int = Query(default=20, ge=1, le=100),
+    db: Session = Depends(get_db),
+):
+    if date_from and date_to and date_from > date_to:
+        raise HTTPException(
+            status_code=422,
+            detail="date_from must be earlier than or equal to date_to",
+        )
+
+    return list_reports(
+        db=db,
+        search=search,
+        module=module,
+        report_type=report_type,
+        status=report_status,
+        owner=owner,
+        date_from=date_from,
+        date_to=date_to,
+        sort_by=sort_by,
+        order=order,
+        skip=(page - 1) * limit,
+        limit=limit,
+    )
+
+
+@router.get("/{report_id}", response_model=ReportResponse)
+def read_report(report_id: int, db: Session = Depends(get_db)):
+    report = get_report(db, report_id)
+
+    if report is None:
+        raise HTTPException(status_code=404, detail="Report not found")
+
+    return report
 
 
 @router.post(
     "",
     response_model=ReportResponse,
-    status_code=201
+    status_code=status.HTTP_201_CREATED,
 )
-def create_report(
-    report_data: ReportCreate,
-    db: Session = Depends(get_db)
+def add_report(
+    payload: ReportCreate,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
 ):
-    if report_data.template_id is not None:
-        template = (
-            db.query(ReportTemplate)
-            .filter(
-                ReportTemplate.id == report_data.template_id
-            )
-            .first()
-        )
+    values = payload.model_dump()
 
-        if not template:
-            raise HTTPException(
-                status_code=404,
-                detail="Report template not found"
-            )
+    if values["template_id"] is not None:
+        template = db.query(ReportTemplate).filter(
+            ReportTemplate.id == values["template_id"]
+        ).first()
 
-    report = Report(
-        report_name=report_data.report_name,
-        module=report_data.module,
-        report_type=report_data.report_type,
-        last_run=report_data.last_run,
-        owner=report_data.owner,
-        status=report_data.status,
-        run_time_seconds=report_data.run_time_seconds,
-        template_id=report_data.template_id,
-    )
+        if template is None:
+            raise HTTPException(status_code=404, detail="Template not found")
 
-    db.add(report)
+    return create_report(db, values)
+
+
+@router.put("/{report_id}", response_model=ReportResponse)
+def edit_report(
+    report_id: int,
+    payload: ReportUpdate,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    report = get_report(db, report_id)
+
+    if report is None:
+        raise HTTPException(status_code=404, detail="Report not found")
+
+    values = payload.model_dump(exclude_unset=True)
+
+    if values.get("template_id") is not None:
+        template = db.query(ReportTemplate).filter(
+            ReportTemplate.id == values["template_id"]
+        ).first()
+
+        if template is None:
+            raise HTTPException(status_code=404, detail="Template not found")
+
+    return update_report(db, report, values)
+
+
+@router.post("/{report_id}/rerun")
+def rerun_report(
+    report_id: int,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    report = get_report(db, report_id)
+
+    if report is None:
+        raise HTTPException(status_code=404, detail="Report not found")
+
+    # This records a re-run request; a background execution engine is not
+    # part of this assignment. Update status and timestamp for the demo.
+    report.status = "Scheduled"
     db.commit()
     db.refresh(report)
-
-    return report
-
-
-@router.get(
-    "",
-    response_model=list[ReportResponse]
-)
-def get_reports(
-    search: str | None = Query(
-        default=None,
-        description="Search by report name or owner"
-    ),
-    module: str | None = Query(default=None),
-    report_type: str | None = Query(default=None),
-    status: str | None = Query(default=None),
-    owner: str | None = Query(default=None),
-    page: int = Query(default=1, ge=1),
-    limit: int = Query(default=10, ge=1, le=100),
-    db: Session = Depends(get_db)
-):
-    query = db.query(Report)
-
-    if search:
-        search_value = f"%{search}%"
-
-        query = query.filter(
-            or_(
-                Report.report_name.ilike(search_value),
-                Report.owner.ilike(search_value)
-            )
-        )
-
-    if module:
-        query = query.filter(
-            Report.module == module
-        )
-
-    if report_type:
-        if report_type not in ["Scheduled", "On Demand"]:
-            raise HTTPException(
-                status_code=400,
-                detail="Invalid report type"
-            )
-
-        query = query.filter(
-            Report.report_type == report_type
-        )
-
-    if status:
-        if status not in [
-            "Completed",
-            "Failed",
-            "Scheduled"
-        ]:
-            raise HTTPException(
-                status_code=400,
-                detail="Invalid report status"
-            )
-
-        query = query.filter(
-            Report.status == status
-        )
-
-    if owner:
-        query = query.filter(
-            Report.owner == owner
-        )
-
-    offset = (page - 1) * limit
-
-    reports = (
-        query
-        .order_by(Report.id)
-        .offset(offset)
-        .limit(limit)
-        .all()
-    )
-
-    return reports
-
-
-@router.get(
-    "/{report_id}",
-    response_model=ReportResponse
-)
-def get_report(
-    report_id: int,
-    db: Session = Depends(get_db)
-):
-    report = (
-        db.query(Report)
-        .filter(Report.id == report_id)
-        .first()
-    )
-
-    if not report:
-        raise HTTPException(
-            status_code=404,
-            detail="Report not found"
-        )
-
-    return report
-
-
-@router.put(
-    "/{report_id}",
-    response_model=ReportResponse
-)
-def update_report(
-    report_id: int,
-    report_data: ReportUpdate,
-    db: Session = Depends(get_db)
-):
-    report = (
-        db.query(Report)
-        .filter(Report.id == report_id)
-        .first()
-    )
-
-    if not report:
-        raise HTTPException(
-            status_code=404,
-            detail="Report not found"
-        )
-
-    if report_data.template_id is not None:
-        template = (
-            db.query(ReportTemplate)
-            .filter(
-                ReportTemplate.id == report_data.template_id
-            )
-            .first()
-        )
-
-        if not template:
-            raise HTTPException(
-                status_code=404,
-                detail="Report template not found"
-            )
-
-    update_data = report_data.model_dump(
-        exclude_unset=True
-    )
-
-    for field, value in update_data.items():
-        setattr(report, field, value)
-
-    db.commit()
-    db.refresh(report)
-
-    return report
-
-
-@router.delete(
-    "/{report_id}"
-)
-def delete_report(
-    report_id: int,
-    db: Session = Depends(get_db)
-):
-    report = (
-        db.query(Report)
-        .filter(Report.id == report_id)
-        .first()
-    )
-
-    if not report:
-        raise HTTPException(
-            status_code=404,
-            detail="Report not found"
-        )
-
-    db.delete(report)
-    db.commit()
 
     return {
-        "message": "Report deleted successfully",
-        "report_id": report_id
+        "message": "Report re-run requested",
+        "report_id": report.id,
+        "status": report.status,
     }
+
+
+@router.delete("/{report_id}")
+def remove_report(
+    report_id: int,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    report = get_report(db, report_id)
+
+    if report is None:
+        raise HTTPException(status_code=404, detail="Report not found")
+
+    delete_report(db, report)
+
+    return {"message": "Report deleted", "report_id": report_id}

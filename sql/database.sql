@@ -413,3 +413,43 @@ VALUES
 );
 
 select * from reports;
+
+USE edabip_reports;
+
+CREATE TABLE IF NOT EXISTS users (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(100) NOT NULL,
+    email VARCHAR(255) NOT NULL UNIQUE,
+    hashed_password VARCHAR(255) NOT NULL,
+    role ENUM('Admin', 'Viewer') NOT NULL DEFAULT 'Viewer',
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_users_email (email)
+);
+
+CREATE TABLE IF NOT EXISTS report_schedules (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    report_id INT NOT NULL,
+    frequency ENUM('Daily', 'Weekly', 'Monthly') NOT NULL,
+    next_run DATETIME NOT NULL,
+    active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    CONSTRAINT fk_schedule_report
+        FOREIGN KEY (report_id)
+        REFERENCES reports(id)
+        ON DELETE CASCADE
+        ON UPDATE CASCADE,
+
+    INDEX idx_schedule_report_id (report_id),
+    INDEX idx_schedule_active_next_run (active, next_run)
+);
+
+-- Indexes for commonly filtered report/activity columns.
+CREATE INDEX idx_activity_created_at
+    ON report_activity(created_at);
+
+CREATE INDEX idx_activity_status_created_at
+    ON report_activity(activity_status, created_at);
+
+CREATE INDEX idx_reports_created_at
+    ON reports(created_at);

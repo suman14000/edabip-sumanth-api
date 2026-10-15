@@ -1,74 +1,96 @@
-from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
+
+from app.core.dependencies import get_current_user, require_admin
 from app.database import get_db
-from app.dependencies import get_current_user, require_admin
-from app.models.report import Report
-from app.models.report_schedule import ReportSchedule
-from app.schemas.report_schedule import ScheduleCreate, ScheduleUpdate, ScheduleResponse
 from app.models.user import User
+from app.schemas.report_schedule import (
+    ScheduleCreate,
+    ScheduleResponse,
+    ScheduleUpdate,
+)
+from app.services.schedule_service import (
+    add_schedule,
+    edit_schedule,
+    get_schedules,
+    set_schedule_active,
+)
 
-router = APIRouter(prefix="/api/report-schedules", tags=["Report Schedules"])
+router = APIRouter(
+    prefix="/api/report-schedules",
+    tags=["Report Schedules"],
+    dependencies=[Depends(get_current_user)],
+)
 
-@router.post("", response_model=ScheduleResponse, status_code=201)
-def create_schedule(payload: ScheduleCreate, db: Session = Depends(get_db), _: User = Depends(require_admin)):
-    if not db.query(Report).filter(Report.id == payload.report_id).first():
+
+@router.post(
+    "",
+    response_model=ScheduleResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_schedule(
+    payload: ScheduleCreate,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    schedule = add_schedule(db, payload.model_dump())
+
+    if schedule is None:
         raise HTTPException(status_code=404, detail="Report not found")
-    row = ReportSchedule(**payload.model_dump())
-    db.add(row)
-    db.commit()
-    db.refresh(row)
-    return row
+
+    return schedule
+
 
 @router.get("", response_model=list[ScheduleResponse])
-def list_schedules(active: bool | None = None, db: Session = Depends(get_db), _: User = Depends(get_current_user)):
-    query = db.query(ReportSchedule)
-    if active is not None:
-        query = query.filter(ReportSchedule.active.is_(active))
-    return query.order_by(ReportSchedule.next_run.asc()).all()
+def list_report_schedules(
+    report_id: int | None = None,
+    db: Session = Depends(get_db),
+):
+    return get_schedules(db, report_id)
 
-@router.get("/{schedule_id}", response_model=ScheduleResponse)
-def get_schedule(schedule_id: int, db: Session = Depends(get_db), _: User = Depends(get_current_user)):
-    row = db.query(ReportSchedule).filter(ReportSchedule.id == schedule_id).first()
-    if not row:
-        raise HTTPException(status_code=404, detail="Schedule not found")
-    return row
 
 @router.put("/{schedule_id}", response_model=ScheduleResponse)
-def update_schedule(schedule_id: int, payload: ScheduleUpdate, db: Session = Depends(get_db), _: User = Depends(require_admin)):
-    row = db.query(ReportSchedule).filter(ReportSchedule.id == schedule_id).first()
-    if not row:
+def update_report_schedule(
+    schedule_id: int,
+    payload: ScheduleUpdate,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    schedule = edit_schedule(
+        db,
+        schedule_id,
+        payload.model_dump(exclude_unset=True),
+    )
+
+    if schedule is None:
         raise HTTPException(status_code=404, detail="Schedule not found")
-    for key, value in payload.model_dump(exclude_unset=True).items():
-        setattr(row, key, value)
-    db.commit()
-    db.refresh(row)
-    return row
+
+    return schedule
+
 
 @router.patch("/{schedule_id}/pause", response_model=ScheduleResponse)
-def pause_schedule(schedule_id: int, db: Session = Depends(get_db), _: User = Depends(require_admin)):
-    row = db.query(ReportSchedule).filter(ReportSchedule.id == schedule_id).first()
-    if not row:
+def pause_report_schedule(
+    schedule_id: int,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    schedule = set_schedule_active(db, schedule_id, False)
+
+    if schedule is None:
         raise HTTPException(status_code=404, detail="Schedule not found")
-    row.active = False
-    db.commit()
-    db.refresh(row)
-    return row
+
+    return schedule
+
 
 @router.patch("/{schedule_id}/resume", response_model=ScheduleResponse)
-def resume_schedule(schedule_id: int, db: Session = Depends(get_db), _: User = Depends(require_admin)):
-    row = db.query(ReportSchedule).filter(ReportSchedule.id == schedule_id).first()
-    if not row:
-        raise HTTPException(status_code=404, detail="Schedule not found")
-    row.active = True
-    db.commit()
-    db.refresh(row)
-    return row
+def resume_report_schedule(
+    schedule_id: int,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    schedule = set_schedule_active(db, schedule_id, True)
 
-@router.delete("/{schedule_id}", status_code=204)
-def delete_schedule(schedule_id: int, db: Session = Depends(get_db), _: User = Depends(require_admin)):
-    row = db.query(ReportSchedule).filter(ReportSchedule.id == schedule_id).first()
-    if not row:
+    if schedule is None:
         raise HTTPException(status_code=404, detail="Schedule not found")
-    db.delete(row)
-    db.commit()
-    return Response(status_code=204)
+
+    return schedule
